@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Launch Radar — pre-token protocols ranked by implied launch value</title>
+<style>
+  :root{--bg:#070a0f;--panel:#0c1119;--panel2:#101724;--line:#1c2635;--txt:#d7e0ec;--dim:#8494a9;--faint:#5b6b80;
+    --grn:#2ee6a8;--amb:#ffb648;--red:#ff6b6b;--blu:#4cc3ff;--mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:var(--mono);font-size:13px;line-height:1.45}
+  a{color:var(--blu);text-decoration:none} a:hover{text-decoration:underline}
+  header{border-bottom:1px solid var(--line);padding:14px 20px;display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;background:var(--panel)}
+  .logo{font-size:19px;font-weight:700;letter-spacing:.5px} .logo b{color:var(--grn)}
+  .tag{color:var(--dim);font-size:12px}
+  .stats{display:flex;gap:10px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid var(--line)}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 14px;min-width:132px}
+  .stat .k{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:1px}
+  .stat .v{font-size:17px;font-weight:700;margin-top:2px}
+  .stat .s{color:var(--dim);font-size:11px}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .bar input,.bar select{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-family:var(--mono);font-size:12px}
+  .bar input[type=search]{min-width:210px}
+  .bar label{color:var(--faint);font-size:11px;display:flex;align-items:center;gap:6px}
+  .wrap{padding:0 20px 30px;overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin-top:6px;min-width:1060px}
+  th{color:var(--faint);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);cursor:pointer;white-space:nowrap;user-select:none}
+  th:first-child,th.l{text-align:left}
+  td{padding:7px 8px;border-bottom:1px solid #121a26;text-align:right;white-space:nowrap}
+  td.l{text-align:left} tr.row{cursor:pointer} tr.row:hover td{background:#0e1622}
+  .nm{font-weight:700;color:#eef4fb}.wl{color:var(--amb);font-size:10px;border:1px solid var(--amb);border-radius:4px;padding:0 4px;margin-left:6px}
+  .pos{color:var(--grn)} .neg{color:var(--red)}
+  .vd{font-weight:700;font-size:11px;padding:2px 7px;border-radius:4px}
+  .FARM{background:#0d2b21;color:var(--grn)} .WATCH{background:#2b210d;color:var(--amb)} .SKIP{background:#2b1214;color:var(--red)}
+  .sc{display:inline-block;min-width:30px;text-align:center;border-radius:4px;background:var(--panel2);border:1px solid var(--line);padding:1px 5px;font-weight:700}
+  .meter{height:5px;background:#16202e;border-radius:3px;overflow:hidden;margin-top:3px}
+  .meter i{display:block;height:100%;background:linear-gradient(90deg,var(--blu),var(--grn))}
+  .foot{color:var(--faint);font-size:11px;padding:14px 20px;border-top:1px solid var(--line)}
+  /* detail */
+  .back{display:inline-block;margin:16px 20px 0;color:var(--blu)}
+  .detail{padding:6px 20px 30px;max-width:1080px}
+  .detail h1{font-size:24px;margin:8px 0 2px}
+  .sub{color:var(--dim);margin-bottom:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:12px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .card .k{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:1px}
+  .card .v{font-size:19px;font-weight:700;margin-top:3px}
+  .card .s{color:var(--dim);font-size:11px;margin-top:2px}
+  h2{font-size:14px;margin:20px 0 8px;color:#eef4fb;text-transform:uppercase;letter-spacing:1px}
+  .steps{width:100%;border-collapse:collapse;min-width:0}
+  .steps td{text-align:left;white-space:normal}
+  .flag{color:var(--amb);font-size:12px;padding:3px 0}
+  .ok{color:var(--grn);font-size:12px}
+  .desc{color:var(--dim);max-width:760px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="data.js"></script>
+<script>
+const B = window.RADAR_BOARD || [], D = window.RADAR_DOSSIER || {};
+const fmt$ = n => n==null ? "—" : n>=1e9 ? "$"+(n/1e9).toFixed(2)+"B" : n>=1e6 ? "$"+(n/1e6).toFixed(1)+"M" : "$"+(n/1e3).toFixed(0)+"K";
+const pct = n => n==null ? "—" : '<span class="'+(n>=0?"pos":"neg")+'">'+(n>=0?"+":"")+n.toFixed(1)+"%</span>";
+const cats = [...new Set(B.map(r=>r.category))].sort();
+const chains = [...new Set(B.flatMap(r=>r.chains))].sort();
+const state = { q:"", cat:"", chain:"", verdict:"", minScore:0, watchOnly:false, sort:"implied_value", dir:-1 };
+
+function boardView(){
+  const rows = B.filter(r =>
+    (!state.q || r.name.toLowerCase().includes(state.q)) &&
+    (!state.cat || r.category===state.cat) &&
+    (!state.chain || r.chains.includes(state.chain)) &&
+    (!state.verdict || r.verdict===state.verdict) &&
+    (!state.watchOnly || r.watchlist) &&
+    r.launch_score >= state.minScore);
+  rows.sort((a,b)=>{ const k=state.sort, d=state.dir; const x=a[k], y=b[k];
+    return (typeof x==="string" ? x.localeCompare(y) : x-y)*d; });
+  const th = (k,label,cls)=>'<th class="'+(cls||"")+'" data-sort="'+k+'">'+label+(state.sort===k?(state.dir<0?" ↓":" ↑"):"")+'</th>';
+  return `
+  <header><div class="logo">LAUNCH<b>RADAR</b></div>
+    <div class="tag">Every pre-token protocol worth watching — priced by what its launch would be worth, with the steps to farm it.</div></header>
+  <div class="stats">
+    <div class="stat"><div class="k">Candidates</div><div class="v">${B.length}</div><div class="s">${D.watchlist_rows||""} on the $50M+ watchlist</div></div>
+    <div class="stat"><div class="k">Combined TVL</div><div class="v">${fmt$(D.combined_tvl)}</div><div class="s">across the board</div></div>
+    <div class="stat"><div class="k">Combined implied</div><div class="v">${fmt$(D.combined_implied_value)}</div><div class="s">if all launched at model value</div></div>
+    <div class="stat"><div class="k">Model</div><div class="v">curve-blend-1</div><div class="s">log-log fit on ${D.peers_with_market_cap||""} tokenised peers · R² ${D.model?D.model.curve.r2:""}</div></div>
+    <div class="stat"><div class="k">Showing</div><div class="v">${rows.length}</div><div class="s">after filters</div></div>
+  </div>
+  <div class="bar">
+    <input type="search" id="q" placeholder="Search protocol…" value="${state.q.replace(/"/g,"&quot;")}">
+    <label>Category <select id="cat"><option value="">All</option>${cats.map(c=>`<option ${c===state.cat?"selected":""}>${c}</option>`).join("")}</select></label>
+    <label>Chain <select id="chain"><option value="">All</option>${chains.map(c=>`<option ${c===state.chain?"selected":""}>${c}</option>`).join("")}</select></label>
+    <label>Verdict <select id="verdict"><option value="">All</option>${["FARM","WATCH","SKIP"].map(v=>`<option ${v===state.verdict?"selected":""}>${v}</option>`).join("")}</select></label>
+    <label>Min score <input type="range" id="minScore" min="0" max="90" step="5" value="${state.minScore}"> <span id="msv">${state.minScore}</span></label>
+    <label><input type="checkbox" id="watchOnly" ${state.watchOnly?"checked":""}> Watchlist only</label>
+  </div>
+  <div class="wrap"><table><thead><tr>
+    ${th("rank","#","l")}${th("name","Protocol","l")}${th("category","Category","l")}${th("tvl","TVL")}${th("change_7d","7d")}
+    ${th("implied_value","Implied value")}${th("implied_multiple","Mult")}${th("launch_score","Score")}${th("verdict","Verdict","l")}
+  </tr></thead><tbody>
+  ${rows.map(r=>`<tr class="row" data-slug="${r.slug}">
+    <td class="l">${r.rank}</td>
+    <td class="l"><span class="nm">${r.name}</span>${r.watchlist?'<span class="wl">WATCHLIST</span>':""}<div style="color:var(--faint);font-size:11px">${r.chains.slice(0,3).join(" · ")||"—"}</div></td>
+    <td class="l">${r.category}</td><td>${fmt$(r.tvl)}</td><td>${pct(r.change_7d)}</td>
+    <td style="font-weight:700">${fmt$(r.implied_value)}</td><td>${r.implied_multiple.toFixed(2)}×</td>
+    <td><span class="sc">${r.launch_score}</span><div class="meter"><i style="width:${r.launch_score}%"></i></div></td>
+    <td class="l"><span class="vd ${r.verdict}">${r.verdict}</span></td></tr>`).join("")}
+  </tbody></table></div>
+  <div class="foot">Method: implied value blends a log-log FDV/TVL curve fitted on tokenised peers with the category's median multiple, then adjusts for 7-day TVL growth and chain breadth. Farm plans are heuristics, not financial advice. Data: DefiLlama-shaped protocol snapshot — see dossier.json.</div>`;
+}
+
+function detailView(slug){
+  const r = B.find(x=>x.slug===slug) || B[0];
+  const planCost = r.farm_plan.reduce((s,x)=>s+x.cost_usd,0);
+  return `
+  <a class="back" href="#/">← back to the board</a>
+  <div class="detail">
+    <h1>${r.name} ${r.watchlist?'<span class="wl">WATCHLIST</span>':""}</h1>
+    <div class="sub">${r.category} · ${r.chains.join(", ")||"—"} · main chain ${r.main_chain}${r.url?` · <a href="${r.url}" rel="noopener">${r.url.replace(/^https?:\/\//,"")}</a>`:""}</div>
+    ${r.description?`<p class="desc">${r.description}</p>`:""}
+    <div class="grid">
+      <div class="card"><div class="k">Implied launch value</div><div class="v">${fmt$(r.implied_value)}</div><div class="s">${r.implied_multiple.toFixed(2)}× its TVL</div></div>
+      <div class="card"><div class="k">TVL</div><div class="v">${fmt$(r.tvl)}</div><div class="s">1d ${r.change_1d==null?"—":r.change_1d.toFixed(1)+"%"} · 7d ${r.change_7d==null?"—":r.change_7d.toFixed(1)+"%"}</div></div>
+      <div class="card"><div class="k">Launch score</div><div class="v">${r.launch_score} / 100</div><div class="s">verdict <span class="vd ${r.verdict}">${r.verdict}</span></div></div>
+      <div class="card"><div class="k">Listed for</div><div class="v">${r.age_days==null?"—":r.age_days+" days"}</div><div class="s">rank #${r.rank} of ${B.length} candidates</div></div>
+    </div>
+    <h2>How the price is built</h2>
+    <div class="grid">
+      <div class="card"><div class="k">Curve value</div><div class="v">${fmt$(r.model.curve_value)}</div><div class="s">log-log FDV/TVL fit on tokenised peers</div></div>
+      <div class="card"><div class="k">Category value</div><div class="v">${fmt$(r.model.category_value)}</div><div class="s">TVL × median multiple of ${r.category}</div></div>
+      <div class="card"><div class="k">Growth factor</div><div class="v">×${r.model.growth_factor.toFixed(3)}</div><div class="s">from 7-day TVL change</div></div>
+      <div class="card"><div class="k">Breadth factor</div><div class="v">×${r.model.breadth_factor.toFixed(3)}</div><div class="s">${r.chains.length} chain(s) live</div></div>
+    </div>
+    <h2>Risk flags</h2>
+    ${r.risk_flags.length ? r.risk_flags.map(f=>`<div class="flag">⚠ ${f}</div>`).join("") : '<div class="ok">✓ No flags on the standard checks.</div>'}
+    <h2>Farm plan — est. total cost $${planCost.toFixed(2)} + position capital</h2>
+    <table class="steps"><tbody>
+    ${r.farm_plan.map(s=>`<tr><td style="width:34px;color:var(--faint)">${s.step}</td><td>${s.action}</td><td style="width:110px">${s.cost_usd? "$"+s.cost_usd.toFixed(2) : "—"}</td><td style="width:110px;color:var(--dim)">${s.time}</td></tr>`).join("")}
+    </tbody></table>
+    <div class="foot">Heuristic plan generated from category, main chain, TVL band and age. Verify every step on the protocol's own site before acting.</div>
+  </div>`;
+}
+
+function render(){
+  const h = location.hash || "#/";
+  const app = document.getElementById("app");
+  if (h.startsWith("#/p/")) { app.innerHTML = detailView(decodeURIComponent(h.slice(4))); window.scrollTo(0,0); return; }
+  if (h.startsWith("#/?")) {
+    const q = new URLSearchParams(h.slice(3));
+    if (q.get("cat")) state.cat = q.get("cat");
+    if (q.get("verdict")) state.verdict = q.get("verdict");
+    if (q.get("chain")) state.chain = q.get("chain");
+    if (q.get("q")) state.q = q.get("q").toLowerCase();
+    if (q.get("minScore")) state.minScore = +q.get("minScore") || 0;
+  }
+  app.innerHTML = boardView();
+  const on = (id, ev, fn) => { const el = document.getElementById(id); if (el) el.addEventListener(ev, fn); };
+  on("q","input",e=>{ state.q = e.target.value.toLowerCase(); render(); const el=document.getElementById("q"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); });
+  on("cat","change",e=>{ state.cat = e.target.value; render(); });
+  on("chain","change",e=>{ state.chain = e.target.value; render(); });
+  on("verdict","change",e=>{ state.verdict = e.target.value; render(); });
+  on("minScore","input",e=>{ state.minScore = +e.target.value; render(); });
+  on("watchOnly","change",e=>{ state.watchOnly = e.target.checked; render(); });
+  document.querySelectorAll("th[data-sort]").forEach(t=>t.addEventListener("click",()=>{
+    const k=t.dataset.sort; if (state.sort===k) state.dir*=-1; else { state.sort=k; state.dir = k==="name"||k==="category" ? 1 : -1; } render(); }));
+  document.querySelectorAll("tr.row").forEach(t=>t.addEventListener("click",()=>{ location.hash = "#/p/"+t.dataset.slug; }));
+}
+window.addEventListener("hashchange", render);
+render();
+</script>
+</body>
+</html>

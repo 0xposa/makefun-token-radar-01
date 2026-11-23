@@ -1,0 +1,39 @@
+{
+ "generated_from": "DefiLlama-shaped protocol snapshot (sealed snapshot at grading; live api.llama.fi/protocols extract for the local build)",
+ "snapshot_protocols": 756,
+ "peers_with_market_cap": 202,
+ "board_rows": 193,
+ "watchlist_rows": 53,
+ "combined_tvl": 19845200409,
+ "combined_implied_value": 2475821959,
+ "model": {
+  "name": "curve-blend-1",
+  "formula": "implied = geometric_mean(exp(a + b*ln TVL), TVL * category_median_multiple) * growth * breadth",
+  "curve": {
+   "intercept_a": 4.7188056891558325,
+   "slope_b": 0.6350546535510077,
+   "peers": 202,
+   "r2": 0.2726
+  },
+  "growth": "1 + clamp(change_7d, -60, 120)/100 * 0.35",
+  "breadth": "1 + min(chains-1, 7) * 0.02",
+  "launch_score": "100 * (0.40 log-TVL percentile across the board + 0.20 7d-growth percentile across the board + 0.15 breadth + 0.15 category token precedent + 0.10 maturity); FARM >= 65, WATCH >= 45"
+ },
+ "funnel": {
+  "rule": "tokenless (symbol '-' or empty), TVL >= $5M, category not in the excluded set (CEX / bridges / staking wrappers), name not a wrapper word and not containing a tokenised parent's name",
+  "excluded_categories": [
+   "CEX",
+   "Bridge",
+   "Canonical Bridge",
+   "Liquid Staking",
+   "Liquid Restaking",
+   "Restaking",
+   "Staking Pool",
+   "Chain",
+   "Wrapped Token",
+   "Synthetic Issuer"
+  ]
+ },
+ "stamp": 20261123,
+ "source": "/home/hatch/workspace/projects/makefun/token-radar/data/snapshot.json"
+}
