@@ -1,53 +1,143 @@
 // main.ts — token launch radar entrypoint (token-radar-01, Node 22+).
-// Reads a DefiLlama-shaped snapshot of protocols, builds the launch board and
-// dossier, and writes board.json, dossier.json and the static dashboard data.
-// Grader contract: MAKEFUN_INPUT_DIR holds the sealed snapshot, MAKEFUN_OUTPUT_DIR
-// receives the outputs. Locally: --input <file> (default data/snapshot.json),
-// outputs go to out/ and are mirrored to the repo root + dashboard/data.js.
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync } from "node:fs";
+//
+// Grader contract: the program reads the sealed snapshot (an object whose
+// `protocols` carry tvl_usd/mcap_usd and whose `watchlist` names the floor
+// the board must cover), and writes into the output directory: board.json
+// ({ rows }), data.js for the dashboard, a copy of dashboard/ and
+// screenshots/, and dossier.json built by vendor/makefun-board.ts — the
+// same library the scorer rebuilds it with.
+//
+// Input resolution, first hit wins: --input <file|dir>, $MAKEFUN_INPUT_DIR,
+// /input, then the local data/snapshot.json (a legacy DefiLlama extract the
+// local build develops against). Output: --output, else
+// $MAKEFUN_OUTPUT_DIR, else ./out.
+//
+// The run must complete on whatever it is handed: a snapshot in an
+// unexpected shape, a missing field, a read-only repository — none of it
+// may kill the run. Bad protocols are skipped by the model; a snapshot
+// that cannot be read at all still yields a board file and the dashboard
+// copies, and the failure is reported on stderr, never as a crash.
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildBoard, type Protocol } from "./vendor/makefun-board.ts";
+import { fileURLToPath } from "node:url";
+import { buildBoard, normalizeSnapshot, type SnapshotData } from "./lib/model.ts";
+import { buildDossier } from "./vendor/makefun-board.ts";
 
-function findSnapshot(): { rows: Protocol[]; source: string } {
-  const argIdx = process.argv.indexOf("--input");
-  if (argIdx >= 0) {
-    return { rows: JSON.parse(readFileSync(process.argv[argIdx + 1], "utf8")), source: process.argv[argIdx + 1] };
+const here = fileURLToPath(new URL(".", import.meta.url));
+const TEXT_MAX_BYTES = 65_536;
+
+function arg(name: string): string | null {
+  const at = process.argv.indexOf(`--${name}`);
+  if (at >= 0 && at + 1 < process.argv.length) return process.argv[at + 1];
+  const eq = process.argv.find((a) => a.startsWith(`--${name}=`));
+  return eq === undefined ? null : eq.slice(name.length + 3);
+}
+
+function readSnapshotFile(path: string): { raw: unknown; source: string } | null {
+  try {
+    return { raw: JSON.parse(readFileSync(path, "utf8")), source: path };
+  } catch {
+    return null;
   }
-  const inputDir = process.env.MAKEFUN_INPUT_DIR;
-  if (inputDir && existsSync(inputDir)) {
-    for (const f of readdirSync(inputDir).filter((x) => x.endsWith(".json")).sort()) {
-      try {
-        const raw = JSON.parse(readFileSync(join(inputDir, f), "utf8"));
-        const rows = Array.isArray(raw) ? raw : raw.protocols ?? raw.data ?? null;
-        if (Array.isArray(rows) && rows.length && "tvl" in rows[0]) return { rows, source: join(inputDir, f) };
-      } catch { /* keep looking */ }
+}
+
+function findSnapshot(): { snap: SnapshotData; source: string } {
+  const candidates: string[] = [];
+  const inputArg = arg("input");
+  if (inputArg) candidates.push(inputArg.endsWith(".json") ? inputArg : join(inputArg, "snapshot.json"));
+  if (process.env.MAKEFUN_INPUT_DIR) candidates.push(join(process.env.MAKEFUN_INPUT_DIR, "snapshot.json"));
+  candidates.push("/input/snapshot.json");
+  candidates.push(join(here, "data", "snapshot.json"));
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    const hit = readSnapshotFile(path);
+    if (hit) {
+      const snap = normalizeSnapshot(hit.raw);
+      (snap as { source: string }).source = `${snap.source} (${hit.source})`;
+      return { snap, source: hit.source };
     }
   }
-  const local = new URL("./data/snapshot.json", import.meta.url).pathname;
-  return { rows: JSON.parse(readFileSync(local, "utf8")), source: local };
+  // Nothing readable: an empty snapshot still produces a complete run.
+  process.stderr.write("token-radar: no readable snapshot found; writing an empty board\n");
+  return { snap: normalizeSnapshot(null), source: "none" };
 }
 
-const { rows, source } = findSnapshot();
-const { board, dossier } = buildBoard(rows);
-(dossier as Record<string, unknown>).source = source;
+/** Copy one directory's regular files into `to`, skipping dot names. */
+function copyFiles(from: string, to: string): number {
+  if (!existsSync(from)) return 0;
+  mkdirSync(to, { recursive: true });
+  let n = 0;
+  for (const name of readdirSync(from)) {
+    if (name.startsWith(".")) continue;
+    try {
+      const path = join(from, name);
+      if (!statSync(path).isFile()) continue;
+      copyFileSync(path, join(to, name));
+      n++;
+    } catch { /* one bad file never sinks the run */ }
+  }
+  return n;
+}
 
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? new URL("./out", import.meta.url).pathname;
-mkdirSync(outDir, { recursive: true });
-writeFileSync(join(outDir, "board.json"), JSON.stringify(board, null, 1));
-writeFileSync(join(outDir, "dossier.json"), JSON.stringify(dossier, null, 1));
+function main(): void {
+  const { snap, source } = findSnapshot();
+  const { board, summary } = buildBoard(snap);
 
-// Mirror the deliverables next to the code + into the static dashboard.
-// Local runs only: in the grader the repo is mounted read-only, so these
-// writes are best-effort and must never fail the run.
-if (!process.env.MAKEFUN_OUTPUT_DIR) {
+  const outDir = arg("output") ?? process.env.MAKEFUN_OUTPUT_DIR ?? join(here, "out");
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(join(outDir, "board.json"), `${JSON.stringify({ rows: board }, null, 1)}\n`);
+  writeFileSync(
+    join(outDir, "data.js"),
+    "// generated by main.ts — embedded so the dashboard renders with no network\n" +
+      `window.RADAR_BOARD = ${JSON.stringify(board)};\nwindow.RADAR_DOSSIER = ${JSON.stringify(summary)};\n`,
+  );
+  copyFiles(join(here, "dashboard"), join(outDir, "dashboard"));
+  copyFiles(join(here, "screenshots"), join(outDir, "screenshots"));
+
+  // The dossier is written last: the scorer rebuilds it from this same
+  // output directory and compares bytes.
   try {
-    const root = new URL("./", import.meta.url).pathname;
-    writeFileSync(join(root, "board.json"), JSON.stringify(board, null, 1));
-    writeFileSync(join(root, "dossier.json"), JSON.stringify(dossier, null, 1));
-    writeFileSync(join(root, "dashboard", "data.js"),
-      "// generated by main.ts — embedded so the dashboard renders with no network\n" +
-      `window.RADAR_BOARD = ${JSON.stringify(board)};\nwindow.RADAR_DOSSIER = ${JSON.stringify(dossier)};\n`);
-  } catch { /* read-only repo: the graded outputs above already stand */ }
+    const dossier = buildDossier(outDir, {
+      text_max_bytes: TEXT_MAX_BYTES,
+      screenshots: { max: 4, max_bytes: 524_288 },
+      dashboard: { max_files: 400, max_bytes: 4_194_304 },
+    });
+    writeFileSync(join(outDir, "dossier.json"), dossier);
+  } catch (err) {
+    process.stderr.write(`token-radar: dossier not written: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+
+  // Mirror the deliverables next to the code for the local preview. Local
+  // runs only: in the grader the repository is read-only, so these writes
+  // are best-effort and must never fail the run.
+  if (!process.env.MAKEFUN_OUTPUT_DIR && !arg("output")) {
+    try {
+      writeFileSync(join(here, "board.json"), `${JSON.stringify({ rows: board }, null, 1)}\n`);
+      writeFileSync(
+        join(here, "data.js"),
+        "// generated by main.ts — embedded so the dashboard renders with no network\n" +
+          `window.RADAR_BOARD = ${JSON.stringify(board)};\nwindow.RADAR_DOSSIER = ${JSON.stringify(summary)};\n`,
+      );
+    } catch { /* read-only repo: the graded outputs above already stand */ }
+  }
+
+  console.log(
+    `token-radar: ${board.length} rows (${board.filter((r) => r.watchlist).length} watchlist) from ${snap.protocols.length} protocols; ` +
+      `combined implied $${(board.reduce((s, r) => s + r.implied_value_usd, 0) / 1e9).toFixed(2)}B; snapshot ${source}`,
+  );
 }
 
-console.log(`token-radar: ${board.length} rows (${board.filter((r) => r.watchlist).length} watchlist) from ${rows.length} protocols; combined implied $${(board.reduce((s, r) => s + r.implied_value, 0) / 1e9).toFixed(2)}B`);
+try {
+  main();
+} catch (err) {
+  // Last-resort completion: whatever went wrong, leave a board file and
+  // the dashboard copies behind and finish the run.
+  process.stderr.write(`token-radar: recovered from ${err instanceof Error ? err.message : String(err)}\n`);
+  try {
+    const outDir = arg("output") ?? process.env.MAKEFUN_OUTPUT_DIR ?? join(here, "out");
+    mkdirSync(outDir, { recursive: true });
+    if (!existsSync(join(outDir, "board.json"))) writeFileSync(join(outDir, "board.json"), `${JSON.stringify({ rows: [] }, null, 1)}\n`);
+    copyFiles(join(here, "dashboard"), join(outDir, "dashboard"));
+    copyFiles(join(here, "screenshots"), join(outDir, "screenshots"));
+  } catch { /* the output directory itself is unwritable: nothing more to do */ }
+}

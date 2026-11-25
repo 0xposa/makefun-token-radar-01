@@ -1,224 +1,373 @@
-// makefun-board.ts — board builder for the token launch radar (token-radar-01).
-// NOTE: for a formal make.fun submission this file is replaced by the kit's own
-// vendor/makefun-board.ts; this is an independent implementation of the same job:
-// read a DefiLlama-shaped snapshot, find the pre-token launch candidates, price
-// what a launch would be worth, and emit board.json + dossier.json.
+// make.fun's dashboard-dossier library for Node 22: one file, the Node standard library only, erasable
+// TypeScript, so it runs as-is under `node main.ts` with no flags, no build and no install. Copy it to
+// vendor/makefun-board.ts in your repository (a copy anywhere else counts as lines you wrote) and import it:
+//
+//   import { buildDossier } from './vendor/makefun-board.ts';
+//   writeFileSync('/output/dossier.json', buildDossier('/output', { text_max_bytes: 65536 }));
+//
+// The bounty's scorer runs this same file, byte for byte, on what you hand in, and requires your
+// dossier.json to equal what buildDossier writes from your dashboard/ and screenshots/.
+//
+//   buildDossier(dir, caps)  the dossier (makefun/dossier/v1) of a dashboard directory, as canonical
+//                            JSON bytes: the screenshots plus a text of the page's source
+//
+// A dossier is one JSON object (contracts/dossier.ts):
+//
+//   schema   "makefun/dossier/v1"
+//   cover    0: the first screenshot by name is the cover
+//   images   the PNG and JPEG files in dir/screenshots/ (names starting with '.' skipped), in name
+//            order, each {name, media_type, sha256, base64}
+//   text     what the judge reads: a "## Dashboard" block (the file count, the bytes, and every file's
+//            path with its size), then "## Source", each text file's path, size and line count and its
+//            contents in a fenced block by path, every file by path
+//
+// The text holds at most caps.text_max_bytes UTF-8 bytes: every file that fits goes in whole, in path
+// order; the first that does not goes in up to its last complete line that fits (its fence closed, then
+// a line naming how many of its lines are not shown), or not at all when not one line fits; nothing
+// follows it but a last line naming how many whole files and how many bytes were left out. A file whose
+// extension is not one of .html .css .js .json .mjs .svg .md .txt is named in the Dashboard block and
+// not shown: the text is source, and the page's images are not source.
+//
+// buildDossier refuses (DossierError) an empty screenshots/ directory, a screenshot name a dossier
+// refuses, a screenshot that is not a whole PNG or JPEG, a screenshot past its byte cap or more
+// screenshots than the count cap, a dashboard file that is not plain (a link, a dot-directory, a name
+// that is not letters, digits and . _ -, a file past its byte cap or more files than the count cap),
+// a text cap that cannot hold the Dashboard block and the cut line, and a dossier past DOSSIER_MAX_BYTES.
+// The caps only refuse: they never shape the bytes. Only text_max_bytes shapes them, so a program that
+// passes {text_max_bytes} and writes the result has written what the scorer, given its other caps too,
+// compares byte for byte.
 
-export interface Protocol {
-  name: string;
-  symbol?: string | null;
-  tvl?: number | null;
-  mcap?: number | null;
-  change_1d?: number | null;
-  change_7d?: number | null;
-  category?: string | null;
-  chains?: string[] | null;
-  url?: string | null;
-  listedAt?: number | null; // unix seconds (DefiLlama)
-  description?: string | null;
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readSync } from 'node:fs';
+import { join } from 'node:path';
+
+/** The dossier schema buildDossier writes (contracts/dossier.ts DOSSIER_SCHEMA). */
+export const DOSSIER_SCHEMA = 'makefun/dossier/v1';
+/** The most bytes a dossier holds (contracts/dossier.ts DOSSIER_MAX_BYTES): 4 MiB. */
+export const DOSSIER_MAX_BYTES = 4 * 1024 * 1024;
+/** The most images a dossier holds (contracts/dossier.ts DOSSIER_MAX_IMAGES). */
+export const DOSSIER_MAX_IMAGES = 8;
+/** A plain file's name (contracts/dossier.ts DossierImageName): a letter, digit or _ first, then letters, digits and . _ -, 1 to 128 of them, no directory. */
+export const PLAIN_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+/** A dashboard file whose contents the dossier's text shows: source, never an image. */
+export const TEXT_FILE = /\.(?:html|css|js|json|mjs|svg|md|txt)$/;
+
+/** What buildDossier is held to: the text's cap in UTF-8 bytes, and, when given, the screenshot and dashboard caps, which only refuse. */
+export interface DossierCaps {
+  text_max_bytes: number;
+  screenshots?: { max: number; max_bytes: number };
+  dashboard?: { max_files: number; max_bytes: number };
 }
 
-export interface FarmStep { step: number; action: string; cost_usd: number; time: string; }
-export interface BoardRow {
-  rank: number;
-  slug: string;
-  name: string;
-  category: string;
-  chains: string[];
-  main_chain: string;
-  tvl: number;
-  change_1d: number | null;
-  change_7d: number | null;
-  age_days: number | null;
-  watchlist: boolean;
-  implied_value: number;
-  implied_multiple: number;
-  model: { curve_value: number; category_value: number | null; growth_factor: number; breadth_factor: number };
-  launch_score: number;
-  verdict: "FARM" | "WATCH" | "SKIP";
-  risk_flags: string[];
-  url: string | null;
-  description: string | null;
-  farm_plan: FarmStep[];
-}
-
-// Categories that cannot launch a farmable protocol token of their own:
-// centralised exchanges, bridges (wrapped representations of other assets),
-// and staking wrappers of assets that already trade.
-const EXCLUDED_CATEGORIES = new Set([
-  "CEX", "Bridge", "Canonical Bridge", "Liquid Staking", "Liquid Restaking",
-  "Restaking", "Staking Pool", "Chain", "Wrapped Token", "Synthetic Issuer",
-]);
-const WRAPPER_WORDS = ["wrapped", "staked ", "restaked"];
-
-const GAS_USD: Record<string, number> = {
-  Ethereum: 12, Solana: 0.05, Bitcoin: 4, Tron: 1.5, BSC: 0.4, Binance: 0.4,
-  Arbitrum: 1, Base: 0.6, Optimism: 0.8, Polygon: 0.3, Avalanche: 1.2, Sui: 0.2, Aptos: 0.2,
-};
-const SNAPSHOT_DAY = 2026 * 10000 + 1123; // fallback "today" stamp when listedAt math needs one
-
-export function slugify(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
-function isTokenless(p: Protocol): boolean {
-  const s = (p.symbol ?? "").trim();
-  return s === "" || s === "-";
-}
-function clamp(x: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, x)); }
-function median(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
-}
-
-// Ordinary least squares on (ln tvl, ln mcap) over the tokenised peers.
-export function fitCurve(peers: Protocol[]): { a: number; b: number; n: number; r2: number } {
-  const pts = peers
-    .filter((p) => (p.tvl ?? 0) >= 1e6 && (p.mcap ?? 0) > 0)
-    .map((p) => [Math.log(p.tvl as number), Math.log(p.mcap as number)] as const);
-  const n = pts.length;
-  const mx = pts.reduce((s, p) => s + p[0], 0) / n;
-  const my = pts.reduce((s, p) => s + p[1], 0) / n;
-  let sxy = 0, sxx = 0, syy = 0;
-  for (const [x, y] of pts) { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; syy += (y - my) ** 2; }
-  const b = sxy / sxx;
-  return { a: my - b * mx, b, n, r2: (sxy * sxy) / (sxx * syy) };
-}
-
-const CATEGORY_ACTION: Record<string, [string, string]> = {
-  Lending: ["Supply a blue-chip asset as collateral", "Borrow a second asset against the supply and loop once"],
-  Dexs: ["Provide liquidity to the deepest pair", "Route a few swaps through the protocol's own front end"],
-  Yield: ["Deposit into the flagship vault", "Claim and redeposit the harvested yield"],
-  "Risk Curators": ["Allocate to the curator's largest vault", "Move a slice to a second vault of the same curator"],
-  "Onchain Capital Allocator": ["Deposit into the main allocation vault", "Withdraw and redeposit across a reporting boundary"],
-  RWA: ["Mint or buy the tokenised real-world asset", "Redeem a small position back to cash"],
-  Derivatives: ["Deposit margin and open a small hedge", "Roll the hedge once before expiry"],
-  "Basis Trading": ["Deposit into the basis vault", "Add a second tranche in a later epoch"],
-  "Yield Aggregator": ["Deposit into an auto-compounding vault", "Switch vaults once to register a second strategy"],
-  "Liquidity Manager": ["Open a managed liquidity position", "Rebalance the position once"],
-  "Leveraged Farming": ["Open a small leveraged position", "Adjust the leverage once"],
-  "Options Vault": ["Deposit into the current option epoch", "Roll into the next epoch"],
-  Perps: ["Deposit margin and open a small hedge", "Roll the hedge once before expiry"],
-};
-function farmPlan(p: Protocol, tvl: number, ageDays: number | null): FarmStep[] {
-  const cat = p.category ?? "DeFi";
-  const main = (p.chains && p.chains[0]) || "Ethereum";
-  const gas = GAS_USD[main] ?? 0.8;
-  const capital = tvl >= 1e9 ? 250 : tvl >= 2.5e8 ? 150 : tvl >= 5e7 ? 100 : 50;
-  const [act1, act2] = CATEGORY_ACTION[cat] ?? ["Make the protocol's core deposit", "Repeat the core action from a second position"];
-  const hold = ageDays !== null && ageDays < 365 ? 30 : 60;
-  return [
-    { step: 1, action: "Fresh wallet; keep the seed phrase offline, never on a cloud note", cost_usd: 3, time: "5 min" },
-    { step: 2, action: `${act1} on ${main} (~$${capital} position)`, cost_usd: Math.round((gas + capital * 0.001) * 100) / 100, time: "15 min" },
-    { step: 3, action: act2, cost_usd: Math.round(gas * 100) / 100, time: "10 min" },
-    { step: 4, action: "One qualifying action a week, same wallet, no wash loops", cost_usd: Math.round(gas * 4 * 100) / 100, time: "4 weeks" },
-    { step: 5, action: `Hold the position ${hold} days so activity spans more than one snapshot`, cost_usd: 0, time: `${hold} days` },
-    { step: 6, action: "Watch the protocol's own channels for a points or season program; join only the official one", cost_usd: 0, time: "weekly check" },
-    { step: 7, action: "If a token launches: claim only from the link the protocol itself publishes; never pay to claim", cost_usd: 0, time: "at launch" },
-  ];
-}
-
-export function buildBoard(snapshot: Protocol[]): { board: BoardRow[]; dossier: Record<string, unknown> } {
-  const peers = snapshot.filter((p) => !isTokenless(p));
-  const curve = fitCurve(peers);
-  const catMult = new Map<string, number>();
-  const catPeerShare = new Map<string, number>();
-  {
-    const byCat = new Map<string, { mult: number[]; tok: number; all: number }>();
-    for (const p of snapshot) {
-      const c = p.category ?? "Other";
-      const e = byCat.get(c) ?? { mult: [], tok: 0, all: 0 };
-      e.all++;
-      if (!isTokenless(p)) { e.tok++; if ((p.tvl ?? 0) >= 1e6 && (p.mcap ?? 0) > 0) e.mult.push((p.mcap as number) / (p.tvl as number)); }
-      byCat.set(c, e);
-    }
-    for (const [c, e] of byCat) { if (e.mult.length >= 3) catMult.set(c, median(e.mult)); catPeerShare.set(c, e.tok / Math.max(1, e.all)); }
+/** Why buildDossier writes no dossier for a directory: its caps, its screenshots, its dashboard or its size. */
+export class DossierError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DossierError';
   }
-  const tokenisedNames = peers.map((p) => p.name.toLowerCase());
-  const nowSec = Math.floor(Date.UTC(2026, 10, 23) / 1000); // fixed stamp: deterministic runs
+}
 
-  const candidates = snapshot.filter((p) => {
-    if (!isTokenless(p)) return false;
-    const tvl = p.tvl ?? 0;
-    if (tvl < 5e6) return false;
-    const cat = p.category ?? "Other";
-    if (EXCLUDED_CATEGORIES.has(cat)) return false;
-    const nm = p.name.toLowerCase();
-    if (WRAPPER_WORDS.some((w) => nm.includes(w))) return false;
-    // a wrapper/staked product of a protocol that already trades carries its parent's name
-    if (tokenisedNames.some((tn) => tn.length >= 5 && nm !== tn && nm.includes(tn))) return false;
-    return true;
+// ---------------------------------------------------------------- bytes
+
+const sha256Hex = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
+const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+const byteLength = (s: string): number => Buffer.byteLength(s, 'utf8');
+
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const JPEG_MAGIC = [0xff, 0xd8, 0xff];
+
+const opensWith = (bytes: Uint8Array, magic: readonly number[]): boolean => bytes.length >= magic.length && magic.every((b, i) => bytes[i] === b);
+
+/**
+ * A regular file's bytes when it is at most `cap` long; never through a link, never more than `cap`
+ * bytes read. A link, a directory or a missing file is a DossierError with `what`.
+ */
+function readCapped(path: string, cap: number, what: string): Uint8Array {
+  let size: number;
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile()) throw new DossierError(`buildDossier: ${what} is not a regular file`);
+    size = st.size;
+  } catch (err) {
+    if (err instanceof DossierError) throw err;
+    throw new DossierError(`buildDossier: ${what} cannot be read`);
+  }
+  if (size > cap) throw new DossierError(`buildDossier: ${what} is ${size} bytes, over the ${cap} a dossier reads`);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    throw new DossierError(`buildDossier: ${what} is not a regular file`);
+  }
+  try {
+    const now = fstatSync(fd).size;
+    if (now > cap) throw new DossierError(`buildDossier: ${what} is ${now} bytes, over the ${cap} a dossier reads`);
+    const buf = Buffer.alloc(now);
+    let at = 0;
+    while (at < buf.length) {
+      const n = readSync(fd, buf, at, buf.length - at, at);
+      if (n === 0) break;
+      at += n;
+    }
+    return new Uint8Array(buf.buffer, buf.byteOffset, at);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Lines of a text: 0 when empty, else its newlines plus one for a last line with none. */
+function lineCount(bytes: Uint8Array): number {
+  if (bytes.length === 0) return 0;
+  let n = 0;
+  for (const b of bytes) if (b === 0x0a) n++;
+  return bytes[bytes.length - 1] === 0x0a ? n : n + 1;
+}
+
+/** A Markdown fence one backtick longer than the longest run in `body`, three at least. */
+function fenceFor(body: string): string {
+  let longest = 0;
+  for (const run of body.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+/** The fence a file's extension is shown with. */
+function languageOf(path: string): string {
+  const ext = path.slice(path.lastIndexOf('.') + 1);
+  return ext === 'mjs' ? 'js' : ext;
+}
+
+/**
+ * JSON with every object's keys in code-unit order and no whitespace: one spelling per value. Takes
+ * null, booleans, finite numbers, strings, arrays and plain objects; throws TypeError on anything else
+ * (undefined, a function, a bigint, NaN, Infinity, a class instance).
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`canonicalJson: ${value} is not a finite number`);
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v)).join(',')}]`;
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) throw new TypeError('canonicalJson: only plain objects and arrays');
+    const o = value as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .sort(byCodeUnit)
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+      .join(',')}}`;
+  }
+  throw new TypeError(`canonicalJson: a ${typeof value} has no JSON form`);
+}
+
+// ---------------------------------------------------------------- the dashboard walk
+
+/** One file of the dashboard tree: its path relative to the directory, and its size in bytes. */
+interface DashFile {
+  path: string;
+  size: number;
+}
+
+/**
+ * Every regular file under `root` (symbolic links are neither followed nor taken for files), in path
+ * order, with its size. Refuses a dot-directory, a file whose name a dossier refuses, an entry that is
+ * neither a file nor a directory, and, when the caps are given, too many files or bytes in all.
+ */
+function dashboardFiles(root: string, caps: { max_files: number; max_bytes: number } | null): DashFile[] {
+  let st: import('node:fs').Stats;
+  try {
+    st = lstatSync(root);
+  } catch {
+    throw new DossierError('buildDossier: no dashboard/ directory: the page and its source are what the judge reads');
+  }
+  if (!st.isDirectory()) throw new DossierError('buildDossier: dashboard is not a directory');
+  const out: DashFile[] = [];
+  let bytes = 0;
+  const stack: string[] = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop()!;
+    for (const e of readdirSync(rel === '' ? root : join(root, rel), { withFileTypes: true })) {
+      const p = rel === '' ? e.name : `${rel}/${e.name}`;
+      if (e.isDirectory()) {
+        if (e.name.startsWith('.')) throw new DossierError(`buildDossier: dashboard/${p} is a dot-directory`);
+        stack.push(p);
+      } else if (e.isFile()) {
+        if (!PLAIN_NAME.test(e.name)) throw new DossierError(`buildDossier: dashboard/${p}: a file's name is letters, digits and . _ -, 1 to 128 characters, not starting with . or -`);
+        const size = lstatSync(join(root, p)).size;
+        out.push({ path: p, size });
+        bytes += size;
+        if (caps !== null && out.length > caps.max_files) throw new DossierError(`buildDossier: dashboard/ holds more than the ${caps.max_files} files it may`);
+        if (caps !== null && bytes > caps.max_bytes) throw new DossierError(`buildDossier: dashboard/'s files come to more than the ${caps.max_bytes} bytes they may`);
+      } else {
+        throw new DossierError(`buildDossier: dashboard/${p} is neither a file nor a directory`);
+      }
+    }
+  }
+  return out.sort((a, b) => byCodeUnit(a.path, b.path));
+}
+
+// ---------------------------------------------------------------- the dossier
+
+/**
+ * The dossier (makefun/dossier/v1, contracts/dossier.ts) of a dashboard directory, as canonical JSON
+ * bytes: `dir/screenshots/`'s PNG and JPEG files (names starting with '.' skipped) are its images, the
+ * first the cover; its text is the "## Dashboard" block and the "## Source" sections described above,
+ * capped at `caps.text_max_bytes` UTF-8 bytes with the cut rule above. Throws DossierError on caps it
+ * cannot keep and on a dashboard or screenshots directory it refuses (see the header).
+ */
+export function buildDossier(dir: string, caps: DossierCaps): Uint8Array {
+  const max = caps.text_max_bytes;
+  if (!Number.isSafeInteger(max) || max <= 0) throw new DossierError(`buildDossier: caps.text_max_bytes must be a positive integer, not ${String(max)}`);
+
+  let maxImages = { n: DOSSIER_MAX_IMAGES, whose: 'a dossier holds' };
+  let maxImageBytes = { n: DOSSIER_MAX_BYTES, whose: 'a dossier holds' };
+  if (caps.screenshots !== undefined) {
+    const s = caps.screenshots as { max?: unknown; max_bytes?: unknown } | null;
+    if (typeof s !== 'object' || s === null) throw new DossierError('buildDossier: caps.screenshots must be an object {max, max_bytes}');
+    for (const k of ['max', 'max_bytes'] as const) {
+      const v = s[k];
+      if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0) throw new DossierError(`buildDossier: caps.screenshots.${k} must be a positive integer, not ${String(v)}`);
+    }
+    if ((s.max as number) < maxImages.n) maxImages = { n: s.max as number, whose: 'caps.screenshots.max allows' };
+    if ((s.max_bytes as number) < maxImageBytes.n) maxImageBytes = { n: s.max_bytes as number, whose: 'caps.screenshots.max_bytes allows' };
+  }
+  let fileCaps: { max_files: number; max_bytes: number } | null = null;
+  if (caps.dashboard !== undefined) {
+    const d = caps.dashboard as { max_files?: unknown; max_bytes?: unknown } | null;
+    if (typeof d !== 'object' || d === null) throw new DossierError('buildDossier: caps.dashboard must be an object {max_files, max_bytes}');
+    for (const k of ['max_files', 'max_bytes'] as const) {
+      const v = d[k];
+      if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0) throw new DossierError(`buildDossier: caps.dashboard.${k} must be a positive integer, not ${String(v)}`);
+    }
+    fileCaps = { max_files: d.max_files as number, max_bytes: d.max_bytes as number };
+  }
+
+  const files = dashboardFiles(join(dir, 'dashboard'), fileCaps);
+
+  const shotsDir = join(dir, 'screenshots');
+  let shotNames: string[];
+  try {
+    shotNames = readdirSync(shotsDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && !e.name.startsWith('.'))
+      .map((e) => e.name)
+      .sort(byCodeUnit);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') throw new DossierError('buildDossier: no screenshots/ directory: the first screenshot is the cover');
+    throw new DossierError('buildDossier: screenshots/ cannot be read');
+  }
+  if (shotNames.length === 0) throw new DossierError('buildDossier: screenshots/ holds no image: the first is the cover');
+  if (shotNames.length > maxImages.n) throw new DossierError(`buildDossier: screenshots/ holds ${shotNames.length} files, over the ${maxImages.n} ${maxImages.whose}`);
+  const images = shotNames.map((name) => {
+    if (!PLAIN_NAME.test(name)) throw new DossierError(`buildDossier: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters, not starting with . or -`);
+    const bytes = readCapped(join(shotsDir, name), maxImageBytes.n, `screenshots/${name}`);
+    const media_type = opensWith(bytes, PNG_MAGIC) ? 'image/png' : opensWith(bytes, JPEG_MAGIC) ? 'image/jpeg' : null;
+    if (media_type === null) throw new DossierError(`buildDossier: screenshots/${name} is neither a PNG nor a JPEG`);
+    return { name, media_type, sha256: sha256Hex(bytes), base64: Buffer.from(bytes).toString('base64') };
   });
 
-  const rows: BoardRow[] = candidates.map((p) => {
-    const tvl = p.tvl as number;
-    const cat = p.category ?? "Other";
-    const chains = p.chains ?? [];
-    const curveValue = Math.exp(curve.a + curve.b * Math.log(tvl));
-    const cm = catMult.get(cat);
-    const categoryValue = cm ? tvl * cm : null;
-    let implied = categoryValue ? Math.sqrt(curveValue * categoryValue) : curveValue;
-    const growth = 1 + (clamp(p.change_7d ?? 0, -60, 120) / 100) * 0.35;
-    const breadth = 1 + Math.min(Math.max(chains.length - 1, 0), 7) * 0.02;
-    implied *= growth * breadth;
-    const ageDays = p.listedAt ? Math.max(0, Math.round((nowSec - p.listedAt) / 86400)) : null;
-    const breadthScore = Math.min(chains.length, 8) / 8;
-    const precedent = catPeerShare.get(cat) ?? 0.2;
-    const maturity = ageDays === null ? 0.5 : clamp(ageDays / 1095, 0, 1);
-    // TVL and growth enter as percentiles across the candidate set (filled in
-    // below, once every candidate is known); store the raw parts meanwhile.
-    const score = Math.round(100 * (0.15 * breadthScore + 0.15 * precedent + 0.1 * maturity));
-    const flags: string[] = [];
-    if (chains.length <= 1) flags.push("Single-chain concentration");
-    if ((p.change_7d ?? 0) < -10) flags.push("TVL falling fast (7d < -10%)");
-    if (ageDays !== null && ageDays < 90) flags.push("Very young listing (<90 days)");
-    if (!p.url) flags.push("No public site on record");
-    if (precedent < 0.25) flags.push("Few token precedents in category");
-    return {
-      rank: 0, slug: slugify(p.name), name: p.name, category: cat, chains,
-      main_chain: chains[0] ?? "—", tvl,
-      change_1d: p.change_1d ?? null, change_7d: p.change_7d ?? null,
-      age_days: ageDays, watchlist: tvl >= 5e7,
-      implied_value: Math.round(implied), implied_multiple: Math.round((implied / tvl) * 1000) / 1000,
-      model: { curve_value: Math.round(curveValue), category_value: categoryValue ? Math.round(categoryValue) : null, growth_factor: Math.round(growth * 1000) / 1000, breadth_factor: Math.round(breadth * 1000) / 1000 },
-      launch_score: score, verdict: score >= 65 ? "FARM" : score >= 45 ? "WATCH" : "SKIP",
-      risk_flags: flags, url: p.url ?? null, description: p.description ?? null,
-      farm_plan: farmPlan(p, tvl, ageDays),
-    };
-  });
-  // Percentile rescoring: TVL (log scale) and 7d growth ranked across the board.
-  {
-    const pct = (xs: number[], v: number) => xs.filter((x) => x <= v).length / Math.max(1, xs.length);
-    const logTvls = rows.map((r) => Math.log10(r.tvl));
-    const growths = rows.map((r) => r.change_7d ?? 0);
-    for (const r of rows) {
-      r.launch_score += Math.round(100 * (0.4 * pct(logTvls, Math.log10(r.tvl)) + 0.2 * pct(growths, r.change_7d ?? 0)));
-      r.verdict = r.launch_score >= 65 ? "FARM" : r.launch_score >= 45 ? "WATCH" : "SKIP";
-    }
-  }
-  rows.sort((x, y) => y.implied_value - x.implied_value || y.tvl - x.tvl);
-  rows.forEach((r, i) => (r.rank = i + 1));
+  const head = [
+    '## Dashboard',
+    '',
+    `Files: ${files.length} (${files.reduce((n, f) => n + f.size, 0)} bytes)`,
+    ...files.map((f) => `- ${f.path} (${f.size} bytes)`),
+    '',
+    '## Source',
+    '',
+    '',
+  ].join('\n');
 
-  const dossier = {
-    generated_from: "DefiLlama-shaped protocol snapshot (sealed snapshot at grading; live api.llama.fi/protocols extract for the local build)",
-    snapshot_protocols: snapshot.length,
-    peers_with_market_cap: curve.n,
-    board_rows: rows.length,
-    watchlist_rows: rows.filter((r) => r.watchlist).length,
-    combined_tvl: Math.round(rows.reduce((s, r) => s + r.tvl, 0)),
-    combined_implied_value: rows.reduce((s, r) => s + r.implied_value, 0),
-    model: {
-      name: "curve-blend-1",
-      formula: "implied = geometric_mean(exp(a + b*ln TVL), TVL * category_median_multiple) * growth * breadth",
-      curve: { intercept_a: curve.a, slope_b: curve.b, peers: curve.n, r2: Math.round(curve.r2 * 10000) / 10000 },
-      growth: "1 + clamp(change_7d, -60, 120)/100 * 0.35",
-      breadth: "1 + min(chains-1, 7) * 0.02",
-      launch_score: "100 * (0.40 log-TVL percentile across the board + 0.20 7d-growth percentile across the board + 0.15 breadth + 0.15 category token precedent + 0.10 maturity); FARM >= 65, WATCH >= 45",
-    },
-    funnel: {
-      rule: "tokenless (symbol '-' or empty), TVL >= $5M, category not in the excluded set (CEX / bridges / staking wrappers), name not a wrapper word and not containing a tokenised parent's name",
-      excluded_categories: [...EXCLUDED_CATEGORIES],
-    },
-    stamp: SNAPSHOT_DAY,
-  };
-  return { board: rows, dossier };
+  // The files whose contents are shown, by path; a binary file is named in the Dashboard block only.
+  const shown = files.filter((f) => TEXT_FILE.test(f.path));
+  interface Section {
+    heading: string;
+    code: ShownFile | null;
+    size: number;
+    bytes: number;
+  }
+  const sections: Section[] = shown.map((f) => {
+    const bytes = readCapped(join(dir, 'dashboard', f.path), DOSSIER_MAX_BYTES, `dashboard/${f.path}`);
+    const lines = lineCount(bytes);
+    const heading = `### ${f.path}\n\n${bytes.length} bytes, ${lines} line${lines === 1 ? '' : 's'}\n\n`;
+    if (bytes.length === 0) return { heading, code: null, size: byteLength(heading), bytes: 0 };
+    const text = new TextDecoder('utf-8').decode(bytes);
+    const fence = fenceFor(text);
+    const lang = languageOf(f.path);
+    const block = `${fence}${lang}\n${text}${text.endsWith('\n') ? '' : '\n'}${fence}\n\n`;
+    return { heading, code: { bytes, text, fence, lang, block, blockBytes: byteLength(block), lines }, size: byteLength(heading) + byteLength(block), bytes: bytes.length };
+  });
+
+  // restBytes[k]: the bytes of the shown files after section k.
+  const restBytes = new Array<number>(sections.length + 1).fill(0);
+  for (let k = sections.length - 1; k >= 0; k--) restBytes[k] = restBytes[k + 1]! + (k + 1 < sections.length ? sections[k + 1]!.bytes : 0);
+
+  const cutLine = (count: number, bytes: number): string => `[Cut at ${max} bytes: ${count} file${count === 1 ? '' : 's'} and ${bytes} bytes left out.]\n`;
+  let out = head;
+  let used = byteLength(head);
+  if (used + byteLength(cutLine(0, 0)) > max) throw new DossierError(`buildDossier: caps.text_max_bytes ${max} cannot hold even the Dashboard block and the cut line`);
+  let kept = 0;
+  for (; kept < sections.length; kept++) {
+    const section = sections[kept]!;
+    const restCount = sections.length - kept - 1;
+    const tail = restCount === 0 ? 0 : byteLength(cutLine(restCount, restBytes[kept]!));
+    if (used + section.size + tail > max) break;
+    out += section.code === null ? section.heading : `${section.heading}${section.code.block}`;
+    used += section.size;
+  }
+  if (kept < sections.length) {
+    // The first file that does not fit whole: its head, up to its last complete line that fits, then nothing more.
+    const first = sections[kept]!;
+    const restCount = sections.length - kept - 1;
+    const after = restBytes[kept]!;
+    const part = first.code === null ? null : fileHead(first.heading, first.code, max - used, (hidden) => cutLine(restCount, after + hidden));
+    out += part ?? cutLine(restCount + 1, after + first.bytes);
+  }
+  if (byteLength(out) > max) throw new DossierError(`buildDossier: caps.text_max_bytes ${max} cannot hold even the Dashboard block and the cut line`);
+
+  const doc = { schema: DOSSIER_SCHEMA, cover: 0, text: out.replace(/\n+$/, '\n'), images };
+  const bytes = Buffer.from(canonicalJson(doc), 'utf8');
+  if (bytes.length > DOSSIER_MAX_BYTES) throw new DossierError(`buildDossier: the dossier is ${bytes.length} bytes, over the ${DOSSIER_MAX_BYTES} one holds`);
+  return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.length);
+}
+
+/** A shown file as the dossier shows it. */
+interface ShownFile {
+  bytes: Uint8Array;
+  text: string;
+  fence: string;
+  /** The language the fence opens with (the file's extension, mjs as js). */
+  lang: string;
+  /** The fenced block: the fence and the language, the text (a last LF added when it lacks one), the fence, a blank line. */
+  block: string;
+  blockBytes: number;
+  lines: number;
+}
+
+/**
+ * A file's section cut inside its contents: its heading, its first k lines in its fence (closed), a line
+ * naming how many of its lines are not shown, then `tail(hidden)` (the cut line, given the bytes this
+ * file leaves out), k the most lines (at least one, fewer than all) whose whole fits in `room` UTF-8
+ * bytes; null when not one line fits. It cuts only after a line's LF, which is never inside a UTF-8
+ * sequence nor a replacement character's bytes, so no character is split, and a line's shown bytes are
+ * those of its text.
+ */
+function fileHead(heading: string, code: ShownFile, room: number, tail: (hidden: number) => string): string | null {
+  const total = code.lines;
+  const lines = code.text.split('\n');
+  const open = `${code.fence}${code.lang}\n`;
+  const close = `${code.fence}\n\n`;
+  const note = (k: number): string => `[${total - k} of this file's ${total} lines not shown.]\n`;
+  const fixed = byteLength(heading) + byteLength(open) + byteLength(close);
+  let best = 0;
+  let shown = 0;
+  let raw = 0;
+  for (let k = 1; k < total; k++) {
+    shown += byteLength(lines[k - 1]!) + 1;
+    raw = code.bytes.indexOf(0x0a, raw) + 1;
+    if (fixed + shown + byteLength(note(k)) + byteLength(tail(code.bytes.length - raw)) <= room) best = k;
+  }
+  if (best === 0) return null;
+  let rawEnd = 0;
+  for (let k = 0; k < best; k++) rawEnd = code.bytes.indexOf(0x0a, rawEnd) + 1;
+  const head = lines.slice(0, best).map((l) => `${l}\n`).join('');
+  return `${heading}${open}${head}${close}${note(best)}${tail(code.bytes.length - rawEnd)}`;
 }
